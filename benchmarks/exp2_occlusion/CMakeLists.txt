@@ -1,0 +1,2 @@
+add_executable(occlusion_main occlusion_main.cpp)
+target_link_libraries(occlusion_main PRIVATE common)

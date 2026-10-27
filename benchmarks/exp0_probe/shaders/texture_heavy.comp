@@ -1,0 +1,23 @@
+#version 460
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0, set = 0, rgba8) uniform readonly image2D inputImage;
+layout(binding = 1, set = 0) buffer OutputBuffer {
+    vec4 values[];
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    ivec2 size = imageSize(inputImage);
+    ivec2 coord = ivec2(idx % size.x, (idx / size.x) % size.y);
+
+    vec4 accum = vec4(0.0);
+    // Unrolled texture fetches across pseudo-random pattern to stress cache and TMUs
+    for (int i = 0; i < 32; i++) {
+        ivec2 c = (coord + ivec2(i * 17, i * 31)) % size;
+        accum += imageLoad(inputImage, c);
+    }
+
+    values[idx] = accum;
+}

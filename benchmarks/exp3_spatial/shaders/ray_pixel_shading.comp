@@ -1,0 +1,79 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+struct PointLight {
+    vec4 posRadius;
+    vec4 color;
+};
+
+layout(std430, binding = 0, set = 0) readonly buffer LightBuffer {
+    PointLight lights[];
+};
+
+layout(binding = 1, set = 0) uniform accelerationStructureEXT lightTLAS;
+layout(binding = 2, set = 0, rgba8) uniform writeonly image2D outShadingImage;
+
+layout(push_constant) uniform PushConstants {
+    mat4 invViewProj;
+    uvec2 resolution;
+    float maxRadius;
+    uint maxLightsPerPixel;
+} pc;
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= pc.resolution.x || pixel.y >= pc.resolution.y) return;
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.resolution);
+    float depth = 0.5;
+    vec4 clip = vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, depth, 1.0);
+    vec4 world = pc.invViewProj * clip;
+    vec3 worldPos = world.xyz / world.w;
+    vec3 normal = vec3(0.0, 1.0, 0.0);
+
+    // Cast ray along +Z from worldPos to test light proxy quads
+    vec3 rayOrigin = worldPos;
+    vec3 rayDir = vec3(0.0, 0.0, 1.0);
+    float rayLength = 2.0 * pc.maxRadius;
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq,
+        lightTLAS,
+        gl_RayFlagsNoneEXT,
+        0xFF,
+        rayOrigin,
+        0.0001,
+        rayDir,
+        rayLength
+    );
+
+    vec3 accumLight = vec3(0.02);
+    uint visited = 0;
+
+    while (rayQueryProceedEXT(rq)) {
+        uint prim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+        uint lIdx = prim / 2; // 2 triangles per light quad
+        PointLight l = lights[lIdx];
+
+        // Since the quad is at Z = Cz + R, intersection at t >= 0 implies worldPos.z <= Cz + R.
+        // Confirm worldPos.z >= Cz - R to ensure worldPos is within Z bounds of the light AABB.
+        if (worldPos.z >= l.posRadius.z - l.posRadius.w) {
+            vec3 toLight = l.posRadius.xyz - worldPos;
+            float dist = length(toLight);
+            if (dist < l.posRadius.w) {
+                vec3 L = toLight / dist;
+                float NdotL = max(0.0, dot(normal, L));
+                float atten = clamp(1.0 - dist / l.posRadius.w, 0.0, 1.0);
+                atten *= atten;
+                accumLight += l.color.rgb * (NdotL * atten);
+            }
+        }
+        visited++;
+        if (visited >= pc.maxLightsPerPixel) break;
+    }
+
+    imageStore(outShadingImage, ivec2(pixel), vec4(clamp(accumLight, 0.0, 1.0), 1.0));
+}

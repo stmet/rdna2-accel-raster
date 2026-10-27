@@ -1,0 +1,2 @@
+add_executable(reflections_main reflections_main.cpp)
+target_link_libraries(reflections_main PRIVATE common)

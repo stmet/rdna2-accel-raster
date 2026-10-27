@@ -1,0 +1,191 @@
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+struct PointLight {
+    vec4 posRadius; // xyz = world pos, w = radius
+    vec4 color;
+};
+
+layout(std430, binding = 0, set = 0) readonly buffer LightBuffer {
+    PointLight lights[];
+};
+
+layout(binding = 1, set = 0) uniform sampler2D depthSampler;
+layout(binding = 2, set = 0, rgba8) uniform writeonly image2D outShadingImage;
+
+layout(push_constant) uniform PushConstants {
+    mat4 invViewProj;
+    mat4 view;
+    mat4 proj;
+    uvec2 resolution;
+    vec2 zNearFar;
+    uint lightCount;
+} pc;
+
+#define MAX_TILE_LIGHTS 512
+
+shared uint s_minDepthUint;
+shared uint s_maxDepthUint;
+shared uint s_tileLightCount;
+shared uint s_tileLightIndices[MAX_TILE_LIGHTS];
+shared vec4 s_frustumPlanes[4]; // Left, Right, Bottom, Top frustum planes in view space
+
+void main() {
+    uint threadIdx = gl_LocalInvocationIndex;
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    uvec2 tileId = gl_WorkGroupID.xy;
+
+    // 1. Initialize LDS
+    if (threadIdx == 0) {
+        s_minDepthUint = 0xFFFFFFFF;
+        s_maxDepthUint = 0;
+        s_tileLightCount = 0;
+
+        // Build tile frustum planes in view space
+        vec2 tileMinUV = vec2(tileId * 16) / vec2(pc.resolution);
+        vec2 tileMaxUV = vec2((tileId + 1) * 16) / vec2(pc.resolution);
+
+        vec2 ndcMin = tileMinUV * 2.0 - 1.0;
+        vec2 ndcMax = tileMaxUV * 2.0 - 1.0;
+
+        // Vulkan Y is inverted
+        float invP00 = 1.0 / pc.proj[0][0];
+        float invP11 = 1.0 / pc.proj[1][1];
+
+        // Frustum corners at Z = -1 in view space
+        vec3 pTL = vec3(ndcMin.x * invP00, ndcMin.y * invP11, -1.0);
+        vec3 pTR = vec3(ndcMax.x * invP00, ndcMin.y * invP11, -1.0);
+        vec3 pBL = vec3(ndcMin.x * invP00, ndcMax.y * invP11, -1.0);
+        vec3 pBR = vec3(ndcMax.x * invP00, ndcMax.y * invP11, -1.0);
+
+        // Plane normals: cross(cornerA, cornerB) pointing inwards
+        vec3 nL = normalize(cross(pBL, pTL));
+        vec3 nR = normalize(cross(pTR, pBR));
+        vec3 nT = normalize(cross(pTL, pTR));
+        vec3 nB = normalize(cross(pBR, pBL));
+
+        s_frustumPlanes[0] = vec4(nL, 0.0);
+        s_frustumPlanes[1] = vec4(nR, 0.0);
+        s_frustumPlanes[2] = vec4(nT, 0.0);
+        s_frustumPlanes[3] = vec4(nB, 0.0);
+    }
+    barrier();
+
+    // 2. Sample Depth and find Tile Min/Max Depth
+    float depth = 1.0;
+    if (pixel.x < pc.resolution.x && pixel.y < pc.resolution.y) {
+        vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.resolution);
+        depth = texture(depthSampler, uv).r;
+        if (depth < 0.9999) {
+            uint dUint = floatBitsToUint(depth);
+            atomicMin(s_minDepthUint, dUint);
+            atomicMax(s_maxDepthUint, dUint);
+        }
+    }
+    barrier();
+
+    // 3. Collaborative Light Culling
+    if (s_minDepthUint <= s_maxDepthUint) {
+        float minD = uintBitsToFloat(s_minDepthUint);
+        float maxD = uintBitsToFloat(s_maxDepthUint);
+
+        // Unproject min/max depth to view-space linear Z (Z is negative in view space)
+        // NDC z = p.z / -vpos.z = (A * -vpos.z + B) / -vpos.z = A - B / vpos.z
+        // linearZ = -vpos.z = B / (A - z_ndc)
+        // In Vulkan perspective with [0, 1] depth:
+        // A = zFar / (zFar - zNear), B = -zNear * zFar / (zFar - zNear)
+        // linearZ = (zNear * zFar) / (zFar - z_ndc * (zFar - zNear))
+        float zNear = pc.zNearFar.x;
+        float zFar = pc.zNearFar.y;
+        float tileZMin = (zNear * zFar) / max(1e-6, zFar - minD * (zFar - zNear));
+        float tileZMax = (zNear * zFar) / max(1e-6, zFar - maxD * (zFar - zNear));
+
+        // Each thread in workgroup tests a subset of lights
+        for (uint l = threadIdx; l < pc.lightCount; l += 256) {
+            PointLight light = lights[l];
+            vec4 vpos4 = pc.view * vec4(light.posRadius.xyz, 1.0);
+            vec3 vpos = vpos4.xyz / vpos4.w;
+            float r = light.posRadius.w;
+            float zDist = -vpos.z;
+
+            // Depth range test
+            if (zDist + r >= tileZMin && zDist - r <= tileZMax) {
+                // Frustum side planes test
+                bool inFrustum = true;
+                for (int p = 0; p < 4; p++) {
+                    float dist = dot(vpos, s_frustumPlanes[p].xyz);
+                    if (dist < -r) {
+                        inFrustum = false;
+                        break;
+                    }
+                }
+
+                if (inFrustum) {
+                    uint slot = atomicAdd(s_tileLightCount, 1);
+                    if (slot < MAX_TILE_LIGHTS) {
+                        s_tileLightIndices[slot] = l;
+                    }
+                }
+            }
+        }
+    }
+    barrier();
+
+    // 4. Shading
+    if (pixel.x >= pc.resolution.x || pixel.y >= pc.resolution.y) return;
+
+    // Background / Sky
+    if (depth >= 0.9999) {
+        imageStore(outShadingImage, ivec2(pixel), vec4(0.01, 0.01, 0.02, 1.0));
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.resolution);
+    vec4 clip = vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, depth, 1.0);
+    vec4 world = pc.invViewProj * clip;
+    vec3 worldPos = world.xyz / world.w;
+
+    // Surface normal from depth gradient
+    vec2 texelSize = 1.0 / vec2(pc.resolution);
+    float dR = texture(depthSampler, uv + vec2(texelSize.x, 0.0)).r;
+    float dD = texture(depthSampler, uv + vec2(0.0, texelSize.y)).r;
+
+    vec3 normal = vec3(0.0, 1.0, 0.0);
+    if (dR < 0.9999 && dD < 0.9999) {
+        vec2 uvR = uv + vec2(texelSize.x, 0.0);
+        vec4 wR = pc.invViewProj * vec4(uvR.x * 2.0 - 1.0, uvR.y * 2.0 - 1.0, dR, 1.0);
+        vec3 posR = wR.xyz / wR.w;
+
+        vec2 uvD = uv + vec2(0.0, texelSize.y);
+        vec4 wD = pc.invViewProj * vec4(uvD.x * 2.0 - 1.0, uvD.y * 2.0 - 1.0, dD, 1.0);
+        vec3 posD = wD.xyz / wD.w;
+
+        vec3 n = cross(posR - worldPos, posD - worldPos);
+        if (length(n) > 1e-6) {
+            normal = normalize(n);
+            if (normal.y < 0.0) normal = -normal;
+        }
+    }
+
+    vec3 accumLight = vec3(0.02); // Ambient baseline
+    uint tileLights = min(s_tileLightCount, MAX_TILE_LIGHTS);
+
+    for (uint i = 0; i < tileLights; i++) {
+        uint lIdx = s_tileLightIndices[i];
+        PointLight l = lights[lIdx];
+
+        vec3 toLight = l.posRadius.xyz - worldPos;
+        float dist = length(toLight);
+        float radius = l.posRadius.w;
+        if (dist < radius) {
+            vec3 L = toLight / dist;
+            float NdotL = max(0.0, dot(normal, L));
+            float atten = max(0.0, 1.0 - dist / radius);
+            atten *= atten;
+            accumLight += l.color.rgb * (NdotL * atten);
+        }
+    }
+
+    imageStore(outShadingImage, ivec2(pixel), vec4(clamp(accumLight, 0.0, 1.0), 1.0));
+}

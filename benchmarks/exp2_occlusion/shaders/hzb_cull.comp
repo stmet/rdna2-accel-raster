@@ -1,0 +1,109 @@
+#version 460
+
+layout(local_size_x = 64) in;
+
+struct InstanceData {
+    vec4 aabbMin; // xyz = min, w = unused
+    vec4 aabbMax; // xyz = max, w = unused
+};
+
+layout(std430, binding = 0, set = 0) readonly buffer InstanceBuffer {
+    InstanceData instances[];
+};
+
+layout(std430, binding = 1, set = 0) writeonly buffer VisibilityBuffer {
+    uint visible[];
+};
+
+layout(binding = 2, set = 0) uniform sampler2D hzbTexture;
+
+layout(push_constant) uniform PushConstants {
+    mat4 viewProj;
+    vec4 frustumPlanes[6];
+    vec2 hzbSize;
+    uint instanceCount;
+    uint maxMipLevel;
+} pc;
+
+bool frustumCull(vec3 bmin, vec3 bmax) {
+    for (int i = 0; i < 6; i++) {
+        vec3 p = bmin;
+        if (pc.frustumPlanes[i].x >= 0.0) p.x = bmax.x;
+        if (pc.frustumPlanes[i].y >= 0.0) p.y = bmax.y;
+        if (pc.frustumPlanes[i].z >= 0.0) p.z = bmax.z;
+
+        if (dot(pc.frustumPlanes[i].xyz, p) + pc.frustumPlanes[i].w < 0.0) {
+            return true; // Culled by frustum
+        }
+    }
+    return false;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.instanceCount) return;
+
+    vec3 bmin = instances[idx].aabbMin.xyz;
+    vec3 bmax = instances[idx].aabbMax.xyz;
+
+    // 1. Frustum Cull
+    if (frustumCull(bmin, bmax)) {
+        visible[idx] = 0;
+        return;
+    }
+
+    // 2. Project 8 AABB corners to clip space
+    vec3 corners[8] = {
+        vec3(bmin.x, bmin.y, bmin.z),
+        vec3(bmax.x, bmin.y, bmin.z),
+        vec3(bmin.x, bmax.y, bmin.z),
+        vec3(bmax.x, bmax.y, bmin.z),
+        vec3(bmin.x, bmin.y, bmax.z),
+        vec3(bmax.x, bmin.y, bmax.z),
+        vec3(bmin.x, bmax.y, bmax.z),
+        vec3(bmax.x, bmax.y, bmax.z)
+    };
+
+    vec3 smin = vec3(1.0);
+    vec3 smax = vec3(-1.0);
+    float nearestZ = 1.0;
+
+    for (int i = 0; i < 8; i++) {
+        vec4 clip = pc.viewProj * vec4(corners[i], 1.0);
+        if (clip.w <= 0.0) {
+            // Straddles near plane: assume visible
+            visible[idx] = 1;
+            return;
+        }
+        vec3 ndc = clip.xyz / clip.w;
+        // Transform [-1, 1] to [0, 1] UV
+        vec2 uv = ndc.xy * 0.5 + 0.5;
+        smin.xy = min(smin.xy, uv);
+        smax.xy = max(smax.xy, uv);
+        nearestZ = min(nearestZ, ndc.z);
+    }
+
+    smin.xy = clamp(smin.xy, vec2(0.0), vec2(1.0));
+    smax.xy = clamp(smax.xy, vec2(0.0), vec2(1.0));
+
+    // Calculate footprint in pixels and choose HZB mip level
+    vec2 sizePx = (smax.xy - smin.xy) * pc.hzbSize;
+    float maxDim = max(sizePx.x, sizePx.y);
+    float mip = clamp(ceil(log2(max(maxDim, 1.0))), 0.0, float(pc.maxMipLevel));
+
+    // Sample 4 corners of bounding rect at chosen mip level
+    float d0 = textureLod(hzbTexture, smin.xy, mip).r;
+    float d1 = textureLod(hzbTexture, vec2(smax.x, smin.y), mip).r;
+    float d2 = textureLod(hzbTexture, vec2(smin.x, smax.y), mip).r;
+    float d3 = textureLod(hzbTexture, smax.xy, mip).r;
+
+    float maxOccluderDepth = max(max(d0, d1), max(d2, d3));
+
+    // Vulkan depth: smaller is closer (0 near, 1 far)
+    // If nearestZ of AABB is farther than maxOccluderDepth, the entire AABB is occluded
+    if (nearestZ > maxOccluderDepth) {
+        visible[idx] = 0; // Occluded
+    } else {
+        visible[idx] = 1; // Visible
+    }
+}

@@ -1,0 +1,79 @@
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+struct PointLight {
+    vec4 posRadius;
+    vec4 color;
+};
+
+#define MAX_LIGHTS_PER_CLUSTER 128
+
+struct ClusterGridData {
+    uint count;
+    uint lightIndices[MAX_LIGHTS_PER_CLUSTER];
+};
+
+layout(std430, binding = 0, set = 0) readonly buffer LightBuffer {
+    PointLight lights[];
+};
+
+layout(std430, binding = 1, set = 0) readonly buffer ClusterGridBuffer {
+    ClusterGridData clusterGrid[];
+};
+
+layout(binding = 2, set = 0, rgba8) uniform writeonly image2D outShadingImage;
+
+layout(push_constant) uniform PushConstants {
+    mat4 invViewProj;
+    mat4 view;
+    uvec2 resolution;
+    uvec3 clusterDims;
+    vec2 zNearFar;
+} pc;
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= pc.resolution.x || pixel.y >= pc.resolution.y) return;
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.resolution);
+    float depth = 0.5;
+    vec4 clip = vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, depth, 1.0);
+    vec4 world = pc.invViewProj * clip;
+    vec3 worldPos = world.xyz / world.w;
+    vec3 normal = vec3(0.0, 1.0, 0.0); // Upward facing surface
+
+    // Cluster indexing
+    uint cx = uint(clamp(uv.x * float(pc.clusterDims.x), 0.0, float(pc.clusterDims.x - 1)));
+    uint cy = uint(clamp(uv.y * float(pc.clusterDims.y), 0.0, float(pc.clusterDims.y - 1)));
+
+    // View-space Z distance
+    vec4 vpos = pc.view * vec4(worldPos, 1.0);
+    float linearZ = -vpos.z;
+
+    float sliceScale = float(pc.clusterDims.z) / log(pc.zNearFar.y / pc.zNearFar.x);
+    float sliceBias = -log(pc.zNearFar.x) * sliceScale;
+    uint cz = uint(clamp(log(max(linearZ, pc.zNearFar.x)) * sliceScale + sliceBias, 0.0, float(pc.clusterDims.z - 1)));
+
+    uint clusterIdx = cx + cy * pc.clusterDims.x + cz * pc.clusterDims.x * pc.clusterDims.y;
+
+    ClusterGridData grid = clusterGrid[clusterIdx];
+
+    vec3 accumLight = vec3(0.02); // Ambient
+    for (uint i = 0; i < grid.count; i++) {
+        uint lIdx = grid.lightIndices[i];
+        PointLight l = lights[lIdx];
+
+        vec3 toLight = l.posRadius.xyz - worldPos;
+        float dist = length(toLight);
+        if (dist < l.posRadius.w) {
+            vec3 L = toLight / dist;
+            float NdotL = max(0.0, dot(normal, L));
+            float atten = clamp(1.0 - dist / l.posRadius.w, 0.0, 1.0);
+            atten *= atten;
+            accumLight += l.color.rgb * (NdotL * atten);
+        }
+    }
+
+    imageStore(outShadingImage, ivec2(pixel), vec4(clamp(accumLight, 0.0, 1.0), 1.0));
+}

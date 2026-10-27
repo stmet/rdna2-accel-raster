@@ -1,0 +1,3 @@
+Triangles,Condition,Time_Median_ms,Throughput_MRays_per_sec,Penalty_Percent
+999698,RA_Alone,1.228480,853.555603,0.0
+999698,RA_With_Texture_Contention,1.521080,689.362793,23.818054

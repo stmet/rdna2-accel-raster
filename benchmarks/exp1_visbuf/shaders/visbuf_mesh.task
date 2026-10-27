@@ -1,0 +1,64 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 32) in;
+
+struct GpuMeshlet {
+    vec4 boundingSphere; // xyz: center, w: radius
+    uint vertexOffset;
+    uint triangleOffset;
+    uint vertexCount;
+    uint triangleCount;
+};
+
+layout(std430, binding = 0, set = 0) readonly buffer MeshletBuffer {
+    GpuMeshlet meshlets[];
+};
+
+layout(push_constant) uniform MeshPushConstants {
+    mat4 viewProj;
+    vec4 frustumPlanes[6];
+    uint meshletCount;
+} pc;
+
+struct TaskPayload {
+    uint meshletIndices[32];
+};
+
+taskPayloadSharedEXT TaskPayload payload;
+
+shared uint survivingCount;
+
+bool sphereInFrustum(vec3 center, float radius) {
+    for (int i = 0; i < 6; i++) {
+        if (dot(pc.frustumPlanes[i].xyz, center) + pc.frustumPlanes[i].w < -radius) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void main() {
+    if (gl_LocalInvocationIndex == 0) {
+        survivingCount = 0;
+    }
+    barrier();
+
+    uint meshletId = gl_GlobalInvocationID.x;
+    bool visible = false;
+
+    if (meshletId < pc.meshletCount) {
+        GpuMeshlet m = meshlets[meshletId];
+        visible = sphereInFrustum(m.boundingSphere.xyz, m.boundingSphere.w);
+    }
+
+    if (visible) {
+        uint slot = atomicAdd(survivingCount, 1);
+        payload.meshletIndices[slot] = meshletId;
+    }
+    barrier();
+
+    if (gl_LocalInvocationIndex == 0) {
+        EmitMeshTasksEXT(survivingCount, 1, 1);
+    }
+}

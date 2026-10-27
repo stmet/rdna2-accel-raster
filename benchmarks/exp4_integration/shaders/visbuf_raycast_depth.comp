@@ -1,0 +1,59 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+layout(binding = 1, set = 0, r32ui) uniform writeonly uimage2D outVisBuf;
+layout(binding = 2, set = 0, r32f) uniform writeonly image2D outDepthBuf;
+
+layout(push_constant) uniform PushConstants {
+    mat4 viewProj;
+    mat4 invViewProj;
+    vec4 camPos;
+    uvec2 resolution;
+} pc;
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= pc.resolution.x || pixel.y >= pc.resolution.y) return;
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.resolution);
+    vec4 clip = vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, 1.0, 1.0);
+    vec4 worldTarget = pc.invViewProj * clip;
+    worldTarget /= worldTarget.w;
+
+    vec3 origin = pc.camPos.xyz;
+    vec3 dir = normalize(worldTarget.xyz - origin);
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq,
+        topLevelAS,
+        gl_RayFlagsNoneEXT,
+        0xFF,
+        origin,
+        0.01,
+        dir,
+        10000.0
+    );
+
+    while (rayQueryProceedEXT(rq)) {
+        // opaque triangles
+    }
+
+    uint visVal = 0;
+    float depthVal = 1.0;
+
+    if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+        uint primId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+        visVal = primId + 1;
+        float hitT = rayQueryGetIntersectionTEXT(rq, true);
+        vec3 hitPos = origin + dir * hitT;
+        vec4 hitClip = pc.viewProj * vec4(hitPos, 1.0);
+        depthVal = clamp(hitClip.z / hitClip.w, 0.0, 1.0);
+    }
+
+    imageStore(outVisBuf, ivec2(pixel), uvec4(visVal, 0, 0, 0));
+    imageStore(outDepthBuf, ivec2(pixel), vec4(depthVal, 0.0, 0.0, 0.0));
+}

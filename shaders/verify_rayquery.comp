@@ -1,0 +1,59 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+// AMD RDNA2 Hardware Ray Query Traversal Verification
+// Traces orthographic rays through TLAS into GPU-built or manually forged BLAS
+// Traversal executed directly by RDNA2 TMU image_bvh_intersect_ray instruction
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+
+struct RayResult {
+    uint hit;          // 1 = hit, 0 = miss
+    float t;           // Hit distance
+    vec2 barycentrics; // (u, v) barycentric coordinates
+};
+
+layout(std430, binding = 1, set = 0) readonly buffer RayOrigins {
+    vec4 origins[]; // .xyz = ray origin, .w = flag (1.0 = normal ray, 0.0 = intentional miss)
+};
+
+layout(std430, binding = 2, set = 0) writeonly buffer OutputBuffer {
+    RayResult results[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint numRays;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= numRays) return;
+
+    vec3 origin = origins[idx].xyz;
+    vec3 direction = vec3(0.0, 0.0, 1.0);
+    float tMin = 0.1;
+    float tMax = 20.0;
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsNoneEXT, 0xFF, origin, tMin, direction, tMax);
+
+    // Hardware ray query traversal executed via RDNA2 TMU image_bvh_intersect_ray
+    while (rayQueryProceedEXT(rq)) {
+        if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+            rayQueryConfirmIntersectionEXT(rq);
+        }
+    }
+
+    uint hitType = rayQueryGetIntersectionTypeEXT(rq, true);
+    if (hitType != gl_RayQueryCommittedIntersectionNoneEXT) {
+        results[idx].hit = 1u;
+        results[idx].t = rayQueryGetIntersectionTEXT(rq, true);
+        results[idx].barycentrics = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+    } else {
+        results[idx].hit = 0u;
+        results[idx].t = -1.0;
+        results[idx].barycentrics = vec2(0.0, 0.0);
+    }
+}

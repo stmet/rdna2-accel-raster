@@ -1,0 +1,62 @@
+# Build directories and CMake outputs
+build/
+bin/
+lib/
+CMakeFiles/
+CMakeScripts/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+compile_commands.json
+
+# Object and library files
+*.o
+*.obj
+!data/*.obj
+*.a
+*.so
+*.dylib
+*.dll
+
+# Compiled executable binaries
+rdna2_bvh_test
+fullframe_benchmark
+async_main
+shadows_main
+reflections_main
+screenspace_main
+fullframe_main
+probe_main
+microbench_main
+dump_shader_stats
+visbuf_main
+occlusion_main
+spatial_main
+integration_main
+
+# Compiled SPIR-V bytecode (built from source)
+*.spv
+
+# Large raw dumps, binary scratch, and test captures
+*.raw
+*.bin
+reference_as.bin
+/tmp/
+*.tmp
+*.log
+
+# Editor and IDE metadata
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python cache and virtual environments
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/

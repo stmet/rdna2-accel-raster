@@ -1,0 +1,70 @@
+#version 460
+
+layout(local_size_x = 64) in;
+
+struct PointLight {
+    vec4 posRadius; // xyz = pos, w = radius
+    vec4 color;     // rgb = color, w = intensity
+};
+
+struct ClusterAABB {
+    vec4 minPoint;
+    vec4 maxPoint;
+};
+
+layout(std430, binding = 0, set = 0) readonly buffer LightBuffer {
+    PointLight lights[];
+};
+
+layout(std430, binding = 1, set = 0) readonly buffer ClusterBuffer {
+    ClusterAABB clusters[];
+};
+
+// Fixed max 128 lights per cluster
+#define MAX_LIGHTS_PER_CLUSTER 128
+
+struct ClusterGridData {
+    uint count;
+    uint lightIndices[MAX_LIGHTS_PER_CLUSTER];
+};
+
+layout(std430, binding = 2, set = 0) writeonly buffer ClusterGridBuffer {
+    ClusterGridData clusterGrid[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint lightCount;
+    uint clusterCount;
+} pc;
+
+bool testSphereAABB(vec3 center, float radius, vec3 bmin, vec3 bmax) {
+    vec3 closest = clamp(center, bmin, bmax);
+    vec3 diff = center - closest;
+    return dot(diff, diff) <= (radius * radius);
+}
+
+void main() {
+    uint clusterIdx = gl_GlobalInvocationID.x;
+    if (clusterIdx >= pc.clusterCount) return;
+
+    vec3 bmin = clusters[clusterIdx].minPoint.xyz;
+    vec3 bmax = clusters[clusterIdx].maxPoint.xyz;
+
+    uint visibleCount = 0;
+    ClusterGridData data;
+
+    for (uint i = 0; i < pc.lightCount; i++) {
+        vec3 lpos = lights[i].posRadius.xyz;
+        float lradius = lights[i].posRadius.w;
+
+        if (testSphereAABB(lpos, lradius, bmin, bmax)) {
+            if (visibleCount < MAX_LIGHTS_PER_CLUSTER) {
+                data.lightIndices[visibleCount] = i;
+            }
+            visibleCount++;
+        }
+    }
+
+    data.count = min(visibleCount, uint(MAX_LIGHTS_PER_CLUSTER));
+    clusterGrid[clusterIdx] = data;
+}

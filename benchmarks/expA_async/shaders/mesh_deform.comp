@@ -1,0 +1,34 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+struct Vertex {
+    vec3 pos;
+    vec3 normal;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer InVertices {
+    Vertex baseVerts[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer OutVertices {
+    Vertex defVerts[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint vertexCount;
+    float time;
+    float amplitude;
+    float frequency;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.vertexCount) return;
+
+    Vertex v = baseVerts[idx];
+    float wave = sin(v.pos.x * pc.frequency + pc.time) * cos(v.pos.z * pc.frequency + pc.time) * pc.amplitude;
+    v.pos.y += wave;
+
+    defVerts[idx] = v;
+}

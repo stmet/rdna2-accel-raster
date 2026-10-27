@@ -1,0 +1,2 @@
+add_executable(integration_main integration_main.cpp)
+target_link_libraries(integration_main PRIVATE common)

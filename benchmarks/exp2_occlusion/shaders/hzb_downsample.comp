@@ -1,0 +1,28 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, set = 0) uniform sampler2D sourceDepth;
+layout(binding = 1, set = 0, r32f) uniform writeonly image2D destDepth;
+
+layout(push_constant) uniform PushConstants {
+    vec2 srcTexelSize;
+    uvec2 destSize;
+} pc;
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= pc.destSize.x || pixel.y >= pc.destSize.y) return;
+
+    vec2 uv = (vec2(pixel) * 2.0 + 1.0) * pc.srcTexelSize;
+    vec2 offset = pc.srcTexelSize * 0.5;
+
+    // Sample 4 texels from source
+    float d0 = texture(sourceDepth, uv + vec2(-offset.x, -offset.y)).r;
+    float d1 = texture(sourceDepth, uv + vec2( offset.x, -offset.y)).r;
+    float d2 = texture(sourceDepth, uv + vec2(-offset.x,  offset.y)).r;
+    float d3 = texture(sourceDepth, uv + vec2( offset.x,  offset.y)).r;
+
+    float maxDepth = max(max(d0, d1), max(d2, d3));
+    imageStore(destDepth, ivec2(pixel), vec4(maxDepth, 0.0, 0.0, 0.0));
+}

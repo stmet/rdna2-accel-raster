@@ -1,0 +1,65 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+
+struct RayInput {
+    vec4 origin;    // xyz = origin, w = tmin
+    vec4 direction; // xyz = dir, w = tmax
+};
+
+struct HitResult {
+    uint hit;       // 1 if hit, 0 if miss
+    float t;
+    uint instanceId;
+    uint primitiveId;
+};
+
+layout(std430, binding = 1, set = 0) readonly buffer RayBuffer {
+    RayInput rays[];
+};
+
+layout(std430, binding = 2, set = 0) writeonly buffer ResultBuffer {
+    HitResult results[];
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= rays.length()) return;
+
+    RayInput r = rays[idx];
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq,
+        topLevelAS,
+        gl_RayFlagsNoneEXT,
+        0xFF,
+        r.origin.xyz,
+        r.origin.w,
+        r.direction.xyz,
+        r.direction.w
+    );
+
+    while (rayQueryProceedEXT(rq)) {
+        // Can handle candidate hits here if non-opaque, but for opaque traversal finishes
+    }
+
+    HitResult res;
+    uint type = rayQueryGetIntersectionTypeEXT(rq, true);
+    if (type != gl_RayQueryCommittedIntersectionNoneEXT) {
+        res.hit = 1;
+        res.t = rayQueryGetIntersectionTEXT(rq, true);
+        res.instanceId = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+        res.primitiveId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+    } else {
+        res.hit = 0;
+        res.t = -1.0;
+        res.instanceId = 0xFFFFFFFF;
+        res.primitiveId = 0xFFFFFFFF;
+    }
+
+    results[idx] = res;
+}

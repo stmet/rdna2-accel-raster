@@ -1,0 +1,108 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+
+layout(local_size_x = 64) in;
+
+struct Vertex {
+    float pos[3];
+    float norm[3];
+};
+
+layout(std430, binding = 0, set = 0) readonly buffer VertexBuffer {
+    Vertex vertices[];
+};
+
+layout(std430, binding = 1, set = 0) readonly buffer IndexBuffer {
+    uint indices[];
+};
+
+layout(std430, binding = 2, set = 0) buffer VisBuffer {
+    uint64_t pixels[];
+};
+
+layout(push_constant) uniform PushConstants {
+    mat4 viewProj;
+    uvec2 resolution;
+    uint triangleCount;
+} pc;
+
+float edgeFunction(vec2 a, vec2 b, vec2 c) {
+    return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x);
+}
+
+void main() {
+    uint triIdx = gl_GlobalInvocationID.x;
+    if (triIdx >= pc.triangleCount) return;
+
+    uint i0 = indices[triIdx * 3 + 0];
+    uint i1 = indices[triIdx * 3 + 1];
+    uint i2 = indices[triIdx * 3 + 2];
+
+    vec3 p0 = vec3(vertices[i0].pos[0], vertices[i0].pos[1], vertices[i0].pos[2]);
+    vec3 p1 = vec3(vertices[i1].pos[0], vertices[i1].pos[1], vertices[i1].pos[2]);
+    vec3 p2 = vec3(vertices[i2].pos[0], vertices[i2].pos[1], vertices[i2].pos[2]);
+
+    vec4 c0 = pc.viewProj * vec4(p0, 1.0);
+    vec4 c1 = pc.viewProj * vec4(p1, 1.0);
+    vec4 c2 = pc.viewProj * vec4(p2, 1.0);
+
+    // Near plane clip
+    if (c0.w <= 0.0 || c1.w <= 0.0 || c2.w <= 0.0) return;
+
+    // Convert NDC [-1, 1] to screen coords [0, width]
+    vec3 ndc0 = c0.xyz / c0.w;
+    vec3 ndc1 = c1.xyz / c1.w;
+    vec3 ndc2 = c2.xyz / c2.w;
+
+    vec2 s0 = (ndc0.xy * 0.5 + 0.5) * vec2(pc.resolution);
+    vec2 s1 = (ndc1.xy * 0.5 + 0.5) * vec2(pc.resolution);
+    vec2 s2 = (ndc2.xy * 0.5 + 0.5) * vec2(pc.resolution);
+
+    float area = edgeFunction(s0, s1, s2);
+    // Backface or degenerate cull
+    if (abs(area) < 1e-5) return;
+    if (area < 0.0) {
+        // Swap s1 and s2 for counter-clockwise
+        vec2 tmp = s1; s1 = s2; s2 = tmp;
+        vec3 tndc = ndc1; ndc1 = ndc2; ndc2 = tndc;
+        area = -area;
+    }
+
+    vec2 bmin = max(min(min(s0, s1), s2), vec2(0.0));
+    vec2 bmax = min(max(max(s0, s1), s2), vec2(pc.resolution) - 1.0);
+
+    int minX = int(floor(bmin.x));
+    int maxX = int(ceil(bmax.x));
+    int minY = int(floor(bmin.y));
+    int maxY = int(ceil(bmax.y));
+
+    // Clamp huge bounding boxes to prevent extreme loops
+    if ((maxX - minX) > 64 || (maxY - minY) > 64) return;
+
+    float invArea = 1.0 / area;
+
+    for (int y = minY; y <= maxY; y++) {
+        for (int x = minX; x <= maxX; x++) {
+            vec2 p = vec2(float(x) + 0.5, float(y) + 0.5);
+
+            float w0 = edgeFunction(s1, s2, p);
+            float w1 = edgeFunction(s2, s0, p);
+            float w2 = edgeFunction(s0, s1, p);
+
+            if (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) {
+                w0 *= invArea;
+                w1 *= invArea;
+                w2 *= invArea;
+
+                float depth = w0 * ndc0.z + w1 * ndc1.z + w2 * ndc2.z;
+                if (depth >= 0.0 && depth <= 1.0) {
+                    uint depthUint = floatBitsToUint(depth);
+                    uint64_t packedVal = (uint64_t(depthUint) << 32) | uint64_t(triIdx + 1);
+                    uint pixelIdx = uint(y) * pc.resolution.x + uint(x);
+                    atomicMin(pixels[pixelIdx], packedVal);
+                }
+            }
+        }
+    }
+}

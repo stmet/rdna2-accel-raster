@@ -1,0 +1,71 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 32) in;
+layout(triangles, max_vertices = 64, max_primitives = 64) out;
+
+struct GpuMeshlet {
+    vec4 boundingSphere;
+    uint vertexOffset;
+    uint triangleOffset;
+    uint vertexCount;
+    uint triangleCount;
+};
+
+struct Vertex {
+    float pos[3];
+    float norm[3];
+};
+
+layout(std430, binding = 0, set = 0) readonly buffer MeshletBuffer {
+    GpuMeshlet meshlets[];
+};
+
+layout(std430, binding = 1, set = 0) readonly buffer VertexBuffer {
+    Vertex vertices[];
+};
+
+layout(std430, binding = 2, set = 0) readonly buffer MeshletIndexBuffer {
+    uint meshletIndices[];
+};
+
+layout(std430, binding = 3, set = 0) readonly buffer MeshletTriBuffer {
+    uint meshletTriangles[];
+};
+
+layout(push_constant) uniform MeshPushConstants {
+    mat4 viewProj;
+    vec4 frustumPlanes[6];
+    uint meshletCount;
+} pc;
+
+struct TaskPayload {
+    uint meshletIndices[32];
+};
+
+taskPayloadSharedEXT TaskPayload payload;
+
+layout(location = 0) flat out uint outPrimId[];
+
+void main() {
+    uint meshletId = payload.meshletIndices[gl_WorkGroupID.x];
+    GpuMeshlet m = meshlets[meshletId];
+
+    SetMeshOutputsEXT(m.vertexCount, m.triangleCount);
+
+    for (uint i = gl_LocalInvocationIndex; i < m.vertexCount; i += 32) {
+        uint globalVIdx = meshletIndices[m.vertexOffset + i];
+        vec3 p = vec3(vertices[globalVIdx].pos[0], vertices[globalVIdx].pos[1], vertices[globalVIdx].pos[2]);
+        gl_MeshVerticesEXT[i].gl_Position = pc.viewProj * vec4(p, 1.0);
+    }
+
+    for (uint i = gl_LocalInvocationIndex; i < m.triangleCount; i += 32) {
+        uint pIdx = m.triangleOffset + i;
+        uint packedTri = meshletTriangles[pIdx];
+        uint i0 = packedTri & 0xFFu;
+        uint i1 = (packedTri >> 8u) & 0xFFu;
+        uint i2 = (packedTri >> 16u) & 0xFFu;
+        gl_PrimitiveTriangleIndicesEXT[i] = uvec3(i0, i1, i2);
+        outPrimId[i] = pIdx + 1;
+    }
+}

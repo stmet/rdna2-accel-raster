@@ -1,0 +1,108 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+struct PointLight {
+    vec4 posRadius;
+    vec4 color;
+};
+
+layout(std430, binding = 0, set = 0) readonly buffer LightBuffer {
+    PointLight lights[];
+};
+
+layout(binding = 1, set = 0) uniform accelerationStructureEXT lightTLAS;
+layout(binding = 2, set = 0) uniform sampler2D depthSampler;
+layout(binding = 3, set = 0, rgba8) uniform writeonly image2D outShadingImage;
+
+layout(push_constant) uniform PushConstants {
+    mat4 invViewProj;
+    mat4 view;
+    uvec2 resolution;
+    float maxRadius;
+    uint maxLightsPerPixel;
+} pc;
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= pc.resolution.x || pixel.y >= pc.resolution.y) return;
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.resolution);
+    float depth = texture(depthSampler, uv).r;
+
+    // Background / Sky
+    if (depth >= 0.9999) {
+        imageStore(outShadingImage, ivec2(pixel), vec4(0.01, 0.01, 0.02, 1.0));
+        return;
+    }
+
+    vec4 clip = vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, depth, 1.0);
+    vec4 world = pc.invViewProj * clip;
+    vec3 worldPos = world.xyz / world.w;
+
+    // Surface normal from depth gradient
+    vec2 texelSize = 1.0 / vec2(pc.resolution);
+    float dR = texture(depthSampler, uv + vec2(texelSize.x, 0.0)).r;
+    float dD = texture(depthSampler, uv + vec2(0.0, texelSize.y)).r;
+
+    vec3 normal = vec3(0.0, 1.0, 0.0);
+    if (dR < 0.9999 && dD < 0.9999) {
+        vec2 uvR = uv + vec2(texelSize.x, 0.0);
+        vec4 wR = pc.invViewProj * vec4(uvR.x * 2.0 - 1.0, uvR.y * 2.0 - 1.0, dR, 1.0);
+        vec3 posR = wR.xyz / wR.w;
+
+        vec2 uvD = uv + vec2(0.0, texelSize.y);
+        vec4 wD = pc.invViewProj * vec4(uvD.x * 2.0 - 1.0, uvD.y * 2.0 - 1.0, dD, 1.0);
+        vec3 posD = wD.xyz / wD.w;
+
+        vec3 n = cross(posR - worldPos, posD - worldPos);
+        if (length(n) > 1e-6) {
+            normal = normalize(n);
+            if (normal.y < 0.0) normal = -normal;
+        }
+    }
+
+    // Cast ray along +Z from worldPos to test light proxy quads
+    vec3 rayOrigin = worldPos;
+    vec3 rayDir = vec3(0.0, 0.0, 1.0);
+    float rayLength = 2.0 * pc.maxRadius;
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq,
+        lightTLAS,
+        gl_RayFlagsNoOpaqueEXT,
+        0xFF,
+        rayOrigin,
+        0.0001,
+        rayDir,
+        rayLength
+    );
+
+    vec3 accumLight = vec3(0.02);
+    uint visited = 0;
+
+    while (rayQueryProceedEXT(rq)) {
+        uint prim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+        uint lIdx = prim / 2; // 2 triangles per light quad
+        PointLight l = lights[lIdx];
+
+        if (worldPos.z >= l.posRadius.z - l.posRadius.w) {
+            vec3 toLight = l.posRadius.xyz - worldPos;
+            float dist = length(toLight);
+            float radius = l.posRadius.w;
+            if (dist < radius) {
+                vec3 L = toLight / dist;
+                float NdotL = max(0.0, dot(normal, L));
+                float atten = max(0.0, 1.0 - dist / radius);
+                atten *= atten;
+                accumLight += l.color.rgb * (NdotL * atten);
+            }
+        }
+        visited++;
+        if (visited >= pc.maxLightsPerPixel) break;
+    }
+
+    imageStore(outShadingImage, ivec2(pixel), vec4(clamp(accumLight, 0.0, 1.0), 1.0));
+}

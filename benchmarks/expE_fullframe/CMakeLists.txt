@@ -1,0 +1,2 @@
+add_executable(fullframe_main fullframe_main.cpp)
+target_link_libraries(fullframe_main PRIVATE common)

@@ -1,0 +1,157 @@
+#version 460
+
+layout(local_size_x = 64) in;
+
+struct RayInput {
+    vec4 origin;    // xyz = origin, w = tmin
+    vec4 direction; // xyz = dir, w = tmax
+};
+
+struct HitResult {
+    uint hit;
+    float t;
+    uint instanceId;
+    uint primitiveId;
+};
+
+struct GpuBvhNode {
+    vec3 aabbMin;
+    int leftChild;
+    vec3 aabbMax;
+    int primCount;
+};
+
+struct GpuTriangle {
+    vec4 v0;
+    vec4 v1;
+    vec4 v2;
+};
+
+layout(std430, binding = 0, set = 0) readonly buffer NodeBuffer {
+    GpuBvhNode nodes[];
+};
+
+layout(std430, binding = 1, set = 0) readonly buffer TriangleBuffer {
+    GpuTriangle triangles[];
+};
+
+layout(std430, binding = 2, set = 0) readonly buffer RayBuffer {
+    RayInput rays[];
+};
+
+layout(std430, binding = 3, set = 0) writeonly buffer ResultBuffer {
+    HitResult results[];
+};
+
+bool intersectAABB(vec3 origin, vec3 invDir, vec3 bMin, vec3 bMax, float tCurrent, out float tBox) {
+    vec3 t0 = (bMin - origin) * invDir;
+    vec3 t1 = (bMax - origin) * invDir;
+    vec3 tmin3 = min(t0, t1);
+    vec3 tmax3 = max(t0, t1);
+
+    float tNear = max(max(tmin3.x, tmin3.y), tmin3.z);
+    float tFar  = min(min(tmax3.x, tmax3.y), tmax3.z);
+
+    tBox = tNear;
+    return (tFar >= max(0.0, tNear)) && (tNear < tCurrent);
+}
+
+bool intersectTriangle(vec3 orig, vec3 dir, vec3 v0, vec3 v1, vec3 v2, inout float tHit) {
+    vec3 edge1 = v1 - v0;
+    vec3 edge2 = v2 - v0;
+    vec3 h = cross(dir, edge2);
+    float a = dot(edge1, h);
+
+    if (abs(a) < 1e-8) return false;
+    float f = 1.0 / a;
+    vec3 s = orig - v0;
+    float u = f * dot(s, h);
+    if (u < 0.0 || u > 1.0) return false;
+
+    vec3 q = cross(s, edge1);
+    float v = f * dot(dir, q);
+    if (v < 0.0 || u + v > 1.0) return false;
+
+    float t = f * dot(edge2, q);
+    if (t > 0.001 && t < tHit) {
+        tHit = t;
+        return true;
+    }
+    return false;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= rays.length()) return;
+
+    RayInput r = rays[idx];
+    vec3 origin = r.origin.xyz;
+    vec3 dir = r.direction.xyz;
+    vec3 invDir;
+    invDir.x = 1.0 / (abs(dir.x) > 1e-8 ? dir.x : (dir.x >= 0.0 ? 1e-8 : -1e-8));
+    invDir.y = 1.0 / (abs(dir.y) > 1e-8 ? dir.y : (dir.y >= 0.0 ? 1e-8 : -1e-8));
+    invDir.z = 1.0 / (abs(dir.z) > 1e-8 ? dir.z : (dir.z >= 0.0 ? 1e-8 : -1e-8));
+
+    float closestT = r.direction.w;
+    uint hitFound = 0;
+    uint hitPrim = 0xFFFFFFFF;
+
+    // Stack traversal
+    uint stack[32];
+    int stackPtr = 0;
+    stack[stackPtr++] = 0; // Root node
+
+    while (stackPtr > 0) {
+        uint nodeIdx = stack[--stackPtr];
+        GpuBvhNode node = nodes[nodeIdx];
+
+        float tBox;
+        if (!intersectAABB(origin, invDir, node.aabbMin, node.aabbMax, closestT, tBox)) {
+            continue;
+        }
+
+        if (node.primCount > 0) {
+            // Leaf node
+            uint primStart = uint(~node.leftChild);
+            for (int i = 0; i < node.primCount; i++) {
+                uint pIdx = primStart + i;
+                GpuTriangle tri = triangles[pIdx];
+                if (intersectTriangle(origin, dir, tri.v0.xyz, tri.v1.xyz, tri.v2.xyz, closestT)) {
+                    hitFound = 1;
+                    hitPrim = pIdx;
+                }
+            }
+        } else {
+            // Inner node: push children
+            uint left = uint(node.leftChild);
+            uint right = left + 1;
+
+            float tLeft, tRight;
+            bool hitL = intersectAABB(origin, invDir, nodes[left].aabbMin, nodes[left].aabbMax, closestT, tLeft);
+            bool hitR = intersectAABB(origin, invDir, nodes[right].aabbMin, nodes[right].aabbMax, closestT, tRight);
+
+            // Push farther node first
+            if (hitL && hitR) {
+                if (tLeft < tRight) {
+                    stack[stackPtr++] = right;
+                    stack[stackPtr++] = left;
+                } else {
+                    stack[stackPtr++] = left;
+                    stack[stackPtr++] = right;
+                }
+            } else if (hitL) {
+                stack[stackPtr++] = left;
+            } else if (hitR) {
+                stack[stackPtr++] = right;
+            }
+        }
+    }
+
+    HitResult res;
+    res.hit = hitFound;
+    res.t = (hitFound == 1) ? closestT : -1.0;
+    res.instanceId = 0;
+    res.primitiveId = hitPrim;
+
+    results[idx] = res;
+}

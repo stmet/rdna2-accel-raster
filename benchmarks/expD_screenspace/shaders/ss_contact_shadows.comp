@@ -1,0 +1,61 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D depthTex;
+layout(set = 0, binding = 1, r8) uniform writeonly image2D outContactShadow;
+
+layout(push_constant) uniform PushConstants {
+    mat4 invViewProj;
+    mat4 proj;
+    vec4 lightDir;
+    uvec2 resolution;
+    float maxDistance;
+    uint maxSteps;
+} pc;
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= pc.resolution.x || pixel.y >= pc.resolution.y) return;
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.resolution);
+    float depth = textureLod(depthTex, uv, 0.0).r;
+    if (depth >= 1.0) {
+        imageStore(outContactShadow, ivec2(pixel), vec4(1.0));
+        return;
+    }
+
+    vec4 ndc = vec4(uv * 2.0 - 1.0, depth, 1.0);
+    vec4 worldPosH = pc.invViewProj * ndc;
+    vec3 worldPos = worldPosH.xyz / worldPosH.w;
+
+    vec3 L = normalize(pc.lightDir.xyz);
+    uint steps = max(8u, pc.maxSteps);
+    float stepSize = pc.maxDistance / float(steps);
+    vec3 curPos = worldPos + vec3(0, 0.02, 0);
+
+    float shadow = 1.0;
+    for (uint i = 0; i < steps; i++) {
+        curPos += L * stepSize;
+
+        vec4 pNDC = pc.proj * vec4(curPos, 1.0);
+        pNDC.xyz /= pNDC.w;
+        vec2 pUV = pNDC.xy * 0.5 + 0.5;
+
+        if (pUV.x < 0.0 || pUV.x > 1.0 || pUV.y < 0.0 || pUV.y > 1.0 || pNDC.z < 0.0 || pNDC.z > 1.0) {
+            break;
+        }
+
+        float sceneDepth = textureLod(depthTex, pUV, 0.0).r;
+        vec4 actualH = pc.invViewProj * vec4(pUV * 2.0 - 1.0, sceneDepth, 1.0);
+        vec3 actualPos = actualH.xyz / actualH.w;
+
+        float diff = curPos.z - actualPos.z;
+        if (diff > 0.005 && diff < stepSize * 2.0) {
+            shadow = 0.0;
+            break;
+        }
+    }
+
+    imageStore(outContactShadow, ivec2(pixel), vec4(shadow));
+}

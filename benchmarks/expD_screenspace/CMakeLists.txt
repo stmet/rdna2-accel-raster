@@ -1,0 +1,2 @@
+add_executable(screenspace_main screenspace_main.cpp)
+target_link_libraries(screenspace_main PRIVATE common)

@@ -1,0 +1,196 @@
+#version 460
+
+layout(local_size_x = 64) in;
+
+struct GpuBvh4Node {
+    vec4 minX;
+    vec4 maxX;
+    vec4 minY;
+    vec4 maxY;
+    vec4 minZ;
+    vec4 maxZ;
+    ivec4 childIndex;
+    ivec4 childCount;
+};
+
+struct GpuTriangle {
+    vec4 v0;
+    vec4 v1;
+    vec4 v2;
+};
+
+layout(std430, binding = 0, set = 0) readonly buffer NodeBuffer {
+    GpuBvh4Node nodes[];
+};
+
+layout(std430, binding = 1, set = 0) readonly buffer TriBuffer {
+    GpuTriangle triangles[];
+};
+
+struct RayStats {
+    uint hit;
+    uint boxTests;
+    uint triTests;
+    uint pad;
+};
+
+layout(std430, binding = 2, set = 0) writeonly buffer StatsBuffer {
+    RayStats stats[];
+};
+
+layout(push_constant) uniform PushConstants {
+    vec4 camPos;
+    vec4 lookAt;
+    uint rayCount;
+    uint isCoherent;
+} pc;
+
+shared int s_stack[64][24];
+
+uint pcg_hash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float hashFloat(uint seed) {
+    return float(pcg_hash(seed)) * (1.0 / 4294967295.0);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.rayCount) return;
+
+    uint tid = gl_LocalInvocationIndex;
+
+    vec3 origin;
+    vec3 dir;
+
+    if (pc.isCoherent == 1) {
+        uint width = 1024;
+        uint height = (pc.rayCount + width - 1) / width;
+        uint x = idx % width;
+        uint y = idx / width;
+
+        float u = (float(x) + 0.5) / float(width) * 2.0 - 1.0;
+        float v = (float(y) + 0.5) / float(height) * 2.0 - 1.0;
+
+        origin = pc.camPos.xyz;
+        vec3 fwd = normalize(pc.lookAt.xyz - pc.camPos.xyz);
+        vec3 right = normalize(cross(fwd, vec3(0, 1, 0)));
+        vec3 up = cross(right, fwd);
+
+        dir = normalize(fwd + right * u * 0.55 + up * v * 0.55);
+    } else {
+        float rx = hashFloat(idx * 6 + 0) * 80.0 - 40.0;
+        float ry = hashFloat(idx * 6 + 1) * 15.0 + 15.0;
+        float rz = hashFloat(idx * 6 + 2) * 80.0 - 40.0;
+        origin = vec3(rx, ry, rz);
+
+        float dx = hashFloat(idx * 6 + 3) * 0.8 - 0.4;
+        float dy = -1.0 - hashFloat(idx * 6 + 4) * 0.5;
+        float dz = hashFloat(idx * 6 + 5) * 0.8 - 0.4;
+        dir = normalize(vec3(dx, dy, dz));
+    }
+
+    vec3 invDir = vec3(
+        abs(dir.x) > 1e-6 ? 1.0 / dir.x : 1e6,
+        abs(dir.y) > 1e-6 ? 1.0 / dir.y : 1e6,
+        abs(dir.z) > 1e-6 ? 1.0 / dir.z : 1e6
+    );
+
+    float rayTMin = 0.01;
+    float hitT = 1000.0;
+    int hitPrim = -1;
+    uint boxTests = 0;
+    uint triTests = 0;
+
+    s_stack[tid][0] = 0;
+    int ptr = 1;
+
+    while (ptr > 0) {
+        int nIdx = s_stack[tid][--ptr];
+        GpuBvh4Node node = nodes[nIdx];
+        boxTests += 4;
+
+        vec4 t0x = (node.minX - origin.x) * invDir.x;
+        vec4 t1x = (node.maxX - origin.x) * invDir.x;
+        vec4 tminX = min(t0x, t1x);
+        vec4 tmaxX = max(t0x, t1x);
+
+        vec4 t0y = (node.minY - origin.y) * invDir.y;
+        vec4 t1y = (node.maxY - origin.y) * invDir.y;
+        vec4 tminY = min(t0y, t1y);
+        vec4 tmaxY = max(t0y, t1y);
+
+        vec4 t0z = (node.minZ - origin.z) * invDir.z;
+        vec4 t1z = (node.maxZ - origin.z) * invDir.z;
+        vec4 tminZ = min(t0z, t1z);
+        vec4 tmaxZ = max(t0z, t1z);
+
+        vec4 tEntry = max(max(tminX, tminY), max(tminZ, vec4(rayTMin)));
+        vec4 tExit  = min(min(tmaxX, tmaxY), min(tmaxZ, vec4(hitT)));
+
+        int hitChildSlot[4];
+        float hitChildT[4];
+        int hitCount = 0;
+
+        for (int k = 0; k < 4; k++) {
+            if (node.childCount[k] != 0 && tExit[k] >= tEntry[k]) {
+                hitChildSlot[hitCount] = k;
+                hitChildT[hitCount] = tEntry[k];
+                hitCount++;
+            }
+        }
+
+        if (hitCount == 0) continue;
+
+        // Sort descending so nearest child is pushed last and popped first
+        for (int i = 0; i < hitCount - 1; i++) {
+            for (int j = i + 1; j < hitCount; j++) {
+                if (hitChildT[i] < hitChildT[j]) {
+                    float tmpT = hitChildT[i]; hitChildT[i] = hitChildT[j]; hitChildT[j] = tmpT;
+                    int tmpS = hitChildSlot[i]; hitChildSlot[i] = hitChildSlot[j]; hitChildSlot[j] = tmpS;
+                }
+            }
+        }
+
+        for (int i = 0; i < hitCount; i++) {
+            int k = hitChildSlot[i];
+            if (node.childCount[k] > 0) {
+                uint first = uint(~node.childIndex[k]);
+                uint cnt = uint(node.childCount[k]);
+                triTests += cnt;
+                for (uint p = 0; p < cnt; p++) {
+                    GpuTriangle tri = triangles[first + p];
+                    vec3 e1 = tri.v1.xyz - tri.v0.xyz;
+                    vec3 e2 = tri.v2.xyz - tri.v0.xyz;
+                    vec3 h = cross(dir, e2);
+                    float a = dot(e1, h);
+                    if (abs(a) < 1e-7) continue;
+                    float f = 1.0 / a;
+                    vec3 s = origin - tri.v0.xyz;
+                    float u = f * dot(s, h);
+                    if (u < 0.0 || u > 1.0) continue;
+                    vec3 q = cross(s, e1);
+                    float v = f * dot(dir, q);
+                    if (v < 0.0 || u + v > 1.0) continue;
+                    float t = f * dot(e2, q);
+                    if (t >= rayTMin && t < hitT) {
+                        hitT = t;
+                        hitPrim = int(first + p);
+                    }
+                }
+            } else if (node.childCount[k] < 0) {
+                if (ptr < 24) {
+                    s_stack[tid][ptr++] = node.childIndex[k];
+                }
+            }
+        }
+    }
+
+    stats[idx].hit = (hitPrim >= 0) ? 1 : 0;
+    stats[idx].boxTests = boxTests;
+    stats[idx].triTests = triTests;
+    stats[idx].pad = 0;
+}

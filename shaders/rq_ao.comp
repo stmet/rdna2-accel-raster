@@ -1,0 +1,98 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevelAS;
+layout(set = 0, binding = 1) uniform sampler2D depthTex;
+layout(set = 0, binding = 2, r8) uniform writeonly image2D outAO;
+
+layout(push_constant) uniform PushConstants {
+    mat4 invViewProj;
+    vec4 camPos;
+    uvec2 resolution;
+    uint samplesPerPixel;
+    float maxAoDistance;
+} pc;
+
+uint hash(uint x) {
+    x += (x << 10u);
+    x ^= (x >> 6u);
+    x += (x << 3u);
+    x ^= (x >> 11u);
+    x += (x << 15u);
+    return x;
+}
+
+float rand(inout uint seed) {
+    seed = hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+vec3 hemisphereSample(vec3 N, inout uint seed) {
+    float u1 = rand(seed);
+    float u2 = rand(seed);
+    float r = sqrt(u1);
+    float theta = 6.2831853 * u2;
+    float x = r * cos(theta);
+    float y = r * sin(theta);
+    float z = sqrt(max(0.0, 1.0 - u1));
+
+    vec3 up = abs(N.z) < 0.999 ? vec3(0, 0, 1) : vec3(1, 0, 0);
+    vec3 tangent = normalize(cross(up, N));
+    vec3 bitangent = cross(N, tangent);
+    return normalize(tangent * x + bitangent * y + N * z);
+}
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= pc.resolution.x || pixel.y >= pc.resolution.y) return;
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.resolution);
+    float depth = textureLod(depthTex, uv, 0.0).r;
+    if (depth >= 1.0) {
+        imageStore(outAO, ivec2(pixel), vec4(1.0));
+        return;
+    }
+
+    vec4 ndc = vec4(uv * 2.0 - 1.0, depth, 1.0);
+    vec4 worldPosH = pc.invViewProj * ndc;
+    vec3 worldPos = worldPosH.xyz / worldPosH.w;
+
+    vec2 texel = 1.0 / vec2(pc.resolution);
+    float depthR = textureLod(depthTex, uv + vec2(texel.x, 0.0), 0.0).r;
+    float depthU = textureLod(depthTex, uv + vec2(0.0, texel.y), 0.0).r;
+    vec4 posRH = pc.invViewProj * vec4((uv + vec2(texel.x, 0.0)) * 2.0 - 1.0, depthR, 1.0);
+    vec4 posUH = pc.invViewProj * vec4((uv + vec2(0.0, texel.y)) * 2.0 - 1.0, depthU, 1.0);
+    vec3 normal = normalize(cross(posRH.xyz / posRH.w - worldPos, posUH.xyz / posUH.w - worldPos));
+    if (dot(normal, pc.camPos.xyz - worldPos) < 0.0) normal = -normal;
+
+    uint seed = pixel.y * pc.resolution.x + pixel.x + 5544u;
+    uint spp = max(1u, pc.samplesPerPixel);
+    float unoccluded = 0.0;
+
+    for (uint i = 0; i < spp; i++) {
+        vec3 dir = hemisphereSample(normal, seed);
+        rayQueryEXT rq;
+        vec3 origin = worldPos + normal * 0.03;
+        rayQueryInitializeEXT(
+            rq,
+            topLevelAS,
+            gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsOpaqueEXT,
+            0xFF,
+            origin,
+            0.01,
+            dir,
+            pc.maxAoDistance
+        );
+        while (rayQueryProceedEXT(rq)) {
+            rayQueryConfirmIntersectionEXT(rq);
+        }
+        if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+            unoccluded += 1.0;
+        }
+    }
+
+    float ao = unoccluded / float(spp);
+    imageStore(outAO, ivec2(pixel), vec4(ao));
+}

@@ -1,0 +1,13 @@
+Effect,Technique,SPP_or_Steps,TimeMs,FPS,PSNR_vs_Ref_dB,SSIM_vs_Ref,Verdict,p5Ms,p95Ms
+AmbientOcclusion,SSAO_Bilateral,16_samples,0.508320,1967.264771,20.535179,0.958382,Baseline,0.505960,0.519640
+AmbientOcclusion,RQAO_Filtered,1_spp,0.503640,1985.545288,40.243099,0.973140,WIN,0.502400,0.527240
+AmbientOcclusion,RQAO_Filtered,2_spp,0.841440,1188.438843,42.980592,0.976076,QualityGain_ExtraCost,0.835560,0.862880
+AmbientOcclusion,RQAO_Filtered,4_spp,1.520760,657.565918,45.425002,0.982700,QualityGain_ExtraCost,1.508240,1.536800
+Reflections,SSR_Raymarching,32_steps,0.078320,12768.130859,7.033896,0.446218,Baseline,0.054080,0.272360
+Reflections,RQR_Hardware,1_spp,0.415760,2405.233643,50.307182,0.999517,QualityGain_ExtraCost,0.414360,0.437280
+Reflections,RQR_Hardware,2_spp,0.775040,1290.255981,51.138331,0.999705,QualityGain_ExtraCost,0.771480,0.797120
+Reflections,RQR_Hardware,4_spp,1.499640,666.826721,54.518226,0.999846,QualityGain_ExtraCost,1.492440,1.518800
+ContactShadows,SSCS_Raymarching,16_steps,0.088520,11296.882812,23.915161,0.991237,Baseline,0.084880,0.158320
+ContactShadows,RQCS_Hardware,1_spp,0.310320,3222.480225,100.000000,1.000000,QualityGain_ExtraCost,0.309080,0.367760
+ContactShadows,RQCS_Hardware,2_spp,0.591440,1690.788574,100.000000,1.000000,QualityGain_ExtraCost,0.588360,0.605920
+ContactShadows,RQCS_Hardware,4_spp,1.150200,869.414001,100.000000,1.000000,QualityGain_ExtraCost,1.146320,1.160400

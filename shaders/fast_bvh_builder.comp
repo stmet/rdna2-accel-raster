@@ -1,0 +1,257 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// AMD RDNA2 GPU-Driven Fast BVH Builder
+// Constructs a full 4-ary Box4 hierarchy + 64-byte triangle leaves directly in a raw VkBuffer
+// Bypasses driver vkCmdBuildAccelerationStructuresKHR with zero scratch memory.
+
+struct AABB {
+    vec3 bmin;
+    vec3 bmax;
+};
+
+struct RadvAccelStructHeader {
+    uint bvh_offset;                // 0x00: Offset to root Box4 node (0xC0 = 192)
+    uint root_flags;                // 0x04: Box flags
+    vec3 aabb_min;                  // 0x08: Scene bounds min
+    vec3 aabb_max;                  // 0x14: Scene bounds max
+    uint update_dispatch_size[3];   // 0x20: Update dispatch [8, 1, 1]
+    uint padding0;                  // 0x2C
+    uint64_t compacted_size;        // 0x30
+    uint64_t serialization_size;    // 0x38
+    uint copy_dispatch_size[3];     // 0x40: Copy dispatch [1, 1, 1]
+    uint padding1;                  // 0x4C
+    uint64_t size;                  // 0x50: Total size
+    uint geometry_type;             // 0x58: 0 = Triangles
+    uint geometry_count;            // 0x5C: 1
+    uint64_t leaf_nodes_offset;     // 0x60: Offset to triangle nodes
+    uint64_t primitive_count;       // 0x68: Number of primitives N
+    uint64_t instance_count;        // 0x70: 0 for BLAS
+    uint leaf_node_offsets_offset;  // 0x78: 0
+    uint build_flags;               // 0x7C: 4 (PREFER_FAST_TRACE)
+    uint type;                      // 0x80: 1 (BLAS)
+    uint padding2;                  // 0x84
+};
+
+struct RadvBvhBox32Node {
+    uint children[4];               // (child_offset_from_bvh_offset >> 3) | type
+    AABB coords[4];                 // 4 Child bounding boxes
+    uint flags;                     // 0
+    uint reserved[3];               // 0, 0, 0
+};
+
+struct RadvBvhTriangleNode {
+    vec3 coords[3];                 // Vertices V0, V1, V2
+    uint reserved[3];               // 0, 0, 0
+    uint triangle_id;               // Primitive index
+    uint geometry_id_and_flags;     // 0x80000000 (RADV_GEOMETRY_OPAQUE)
+    uint reserved2;                 // 0
+    uint id;                        // 0x9 (RADV_BARYCENTRICS_CONTROL_DEFAULT)
+};
+
+layout(buffer_reference, scalar) buffer VertexBuffer {
+    vec3 vertices[];
+};
+
+layout(buffer_reference, scalar) buffer HeaderRef {
+    RadvAccelStructHeader header;
+};
+
+layout(buffer_reference, scalar) buffer BoxNodeRef {
+    RadvBvhBox32Node nodes[];
+};
+
+layout(buffer_reference, scalar) buffer TriNodeRef {
+    RadvBvhTriangleNode nodes[];
+};
+
+layout(buffer_reference, scalar) buffer RawBuffer {
+    uint dwords[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint64_t vertexBufferAddr;
+    uint64_t asBufferAddr;
+    uint numTriangles;
+    uint totalBoxes;
+    uint numLevels;
+    uint totalAsSize;
+    uint levelOffsets[8];
+    uint levelCounts[8];
+};
+
+// Maximum Box4 nodes across all levels for N <= 4096 is 1365
+shared vec3 shared_bmin[1365];
+shared vec3 shared_bmax[1365];
+
+layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    VertexBuffer vbuf = VertexBuffer(vertexBufferAddr);
+    BoxNodeRef boxNodes = BoxNodeRef(asBufferAddr + 192);
+    TriNodeRef triNodes = TriNodeRef(asBufferAddr + 192 + totalBoxes * 128);
+    RawBuffer rawBuf = RawBuffer(asBufferAddr);
+
+    // -------------------------------------------------------------------------
+    // Phase 1: Process Leaf Box4 Nodes and Triangle Nodes
+    // -------------------------------------------------------------------------
+    uint leafLevel = numLevels - 1;
+    uint leafCount = levelCounts[leafLevel];
+    uint leafOffset = levelOffsets[leafLevel];
+
+    if (tid < leafCount) {
+        uint gnode = leafOffset + tid;
+        RadvBvhBox32Node leafBox;
+        leafBox.flags = 0;
+        leafBox.reserved[0] = 0;
+        leafBox.reserved[1] = 0;
+        leafBox.reserved[2] = 0;
+
+        vec3 umin = vec3(1e30);
+        vec3 umax = vec3(-1e30);
+
+        for (uint c = 0; c < 4; ++c) {
+            uint tri_idx = 4 * tid + c;
+            if (tri_idx < numTriangles) {
+                vec3 v0 = vbuf.vertices[tri_idx * 3 + 0];
+                vec3 v1 = vbuf.vertices[tri_idx * 3 + 1];
+                vec3 v2 = vbuf.vertices[tri_idx * 3 + 2];
+
+                vec3 tmin = min(v0, min(v1, v2));
+                vec3 tmax = max(v0, max(v1, v2));
+
+                // Write 64-byte Triangle Leaf Node
+                RadvBvhTriangleNode tri;
+                tri.coords[0] = v0;
+                tri.coords[1] = v1;
+                tri.coords[2] = v2;
+                tri.reserved[0] = 0;
+                tri.reserved[1] = 0;
+                tri.reserved[2] = 0;
+                tri.triangle_id = tri_idx;
+                tri.geometry_id_and_flags = 0x80000000u; // RADV_GEOMETRY_OPAQUE
+                tri.reserved2 = 0;
+                tri.id = 9u; // RADV_BARYCENTRICS_CONTROL_DEFAULT
+                triNodes.nodes[tri_idx] = tri;
+
+                // Child pointer: relative to bvh_offset (192)
+                uint triRelOffset = totalBoxes * 128 + tri_idx * 64;
+                leafBox.children[c] = (triRelOffset >> 3) | 0u; // Type 0 = Triangle
+                leafBox.coords[c].bmin = tmin;
+                leafBox.coords[c].bmax = tmax;
+
+                umin = min(umin, tmin);
+                umax = max(umax, tmax);
+            } else {
+                // Empty / invalid slot
+                float qnan = uintBitsToFloat(0x7fc00000u);
+                leafBox.children[c] = 0xFFFFFFFFu;
+                leafBox.coords[c].bmin = vec3(qnan);
+                leafBox.coords[c].bmax = vec3(qnan);
+            }
+        }
+
+        boxNodes.nodes[gnode] = leafBox;
+        shared_bmin[gnode] = umin;
+        shared_bmax[gnode] = umax;
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 2: Bottom-Up Reduction for Internal Box4 Nodes
+    // -------------------------------------------------------------------------
+    for (int lvl = int(numLevels) - 2; lvl >= 0; --lvl) {
+        barrier();
+        memoryBarrierShared();
+
+        uint count = levelCounts[lvl];
+        uint off = levelOffsets[lvl];
+        uint childOff = levelOffsets[lvl + 1];
+        uint childCount = levelCounts[lvl + 1];
+
+        if (tid < count) {
+            uint pnode = off + tid;
+            RadvBvhBox32Node pbox;
+            pbox.flags = 0;
+            pbox.reserved[0] = 0;
+            pbox.reserved[1] = 0;
+            pbox.reserved[2] = 0;
+
+            vec3 umin = vec3(1e30);
+            vec3 umax = vec3(-1e30);
+
+            for (uint c = 0; c < 4; ++c) {
+                uint childLocal = 4 * tid + c;
+                if (childLocal < childCount) {
+                    uint childGlobal = childOff + childLocal;
+                    uint childRelOffset = childGlobal * 128;
+                    pbox.children[c] = (childRelOffset >> 3) | 5u; // Type 5 = Box32
+
+                    vec3 cmin = shared_bmin[childGlobal];
+                    vec3 cmax = shared_bmax[childGlobal];
+                    pbox.coords[c].bmin = cmin;
+                    pbox.coords[c].bmax = cmax;
+
+                    umin = min(umin, cmin);
+                    umax = max(umax, cmax);
+                } else {
+                    float qnan = uintBitsToFloat(0x7fc00000u);
+                    pbox.children[c] = 0xFFFFFFFFu;
+                    pbox.coords[c].bmin = vec3(qnan);
+                    pbox.coords[c].bmax = vec3(qnan);
+                }
+            }
+
+            boxNodes.nodes[pnode] = pbox;
+            shared_bmin[pnode] = umin;
+            shared_bmax[pnode] = umax;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 3: Root Node Finalization & Header Initialization (Thread 0)
+    // -------------------------------------------------------------------------
+    barrier();
+    memoryBarrierShared();
+
+    if (tid == 0) {
+        vec3 sceneMin = shared_bmin[0];
+        vec3 sceneMax = shared_bmax[0];
+
+        // 1. Acceleration Structure Header at offset 0
+        HeaderRef href = HeaderRef(asBufferAddr);
+        href.header.bvh_offset = 192u; // 0xC0
+        href.header.root_flags = 0u;
+        href.header.aabb_min = sceneMin;
+        href.header.aabb_max = sceneMax;
+        href.header.update_dispatch_size[0] = 8u;
+        href.header.update_dispatch_size[1] = 1u;
+        href.header.update_dispatch_size[2] = 1u;
+        href.header.padding0 = 0u;
+        href.header.compacted_size = uint64_t(totalAsSize);
+        href.header.serialization_size = uint64_t(totalAsSize + 128);
+        href.header.copy_dispatch_size[0] = 1u;
+        href.header.copy_dispatch_size[1] = 1u;
+        href.header.copy_dispatch_size[2] = 1u;
+        href.header.padding1 = 0u;
+        href.header.size = uint64_t(totalAsSize);
+        href.header.geometry_type = 0u; // Triangles
+        href.header.geometry_count = 1u;
+        href.header.leaf_nodes_offset = uint64_t(192 + totalBoxes * 128);
+        href.header.primitive_count = uint64_t(numTriangles);
+        href.header.instance_count = 0u;
+        href.header.leaf_node_offsets_offset = 0u;
+        href.header.build_flags = 4u; // PREFER_FAST_TRACE
+        href.header.type = 1u; // BLAS
+        href.header.padding2 = 0u;
+
+        // 2. Pre-root negative parent links
+        // Offset 180 (0xB4): 0x5 (Box32)
+        // Offset 188 (0xBC): 0xFFFFFFFF
+        rawBuf.dwords[180 / 4] = 5u;
+        rawBuf.dwords[188 / 4] = 0xFFFFFFFFu;
+    }
+}
